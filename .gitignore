@@ -1,0 +1,30 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment and secrets
+.env
+.env.*
+
+# IDE and editor metadata
+.idea/
+.vscode/
+HallucinationCreation.iml
+
+# uv cache
+.uv-cache/
+
+# Data outputs
+data/raw/*.jsonl
+data/processed/*.csv
+data/processed/*.parquet
+
+# Miscellaneous
+.DS_Store
+

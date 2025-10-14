@@ -32,6 +32,20 @@ uv run python main.py --max-parallel-llm 3
 Add `--balance-verdicts` if you want to trim the processed dataset to equal counts of supported and unsupported claims before export.
 Use `--num-domains 1` to restrict the run to a single domain during smoke testing.
 
+#### Resuming A Failed Run
+
+If a previous collection stopped early, you can resume without repeating completed work:
+
+```bash
+uv run python main.py \
+  --resume-raw data/raw/claims_2025-10-13_215333.jsonl \
+  --resume-processed data/processed/dataset_2025-10-13_215333.csv
+```
+
+- Pass the raw JSONL from the partial run via `--resume-raw`; new claims append to that file with their processed metadata embedded per row.
+- Provide the matching processed export through `--resume-processed` (CSV, Parquet, or JSONL). The pipeline seeds its in-memory buffer from that artifact, retaining train/test splits and verdict counts.
+- Domains that already hit `--max-claims-per-domain` are skipped automatically, and attempt indices continue from the last stored value.
+
 The script wires up the web-enabled agent components from
 `src/hallucination_creation/` and exports intermediate artifacts to
 `data/raw/`, with curated datasets written to `data/processed/`. See the

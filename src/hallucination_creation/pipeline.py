@@ -12,7 +12,13 @@ from .claim_generator import ClaimDraft, ClaimGenerator, ClaimGeneratorConfig
 from .domains import ALL_DOMAINS, DomainPrompt, default_domains
 from .evaluator import EvaluationResult, HallucinationEvaluator
 from .retriever import EvidenceRetriever, OpenAIWebRetriever, serialize_evidence, timestamp_now
-from .writer import DatasetWriter, ProcessedRecord, RawRecord
+from .writer import (
+    DatasetWriter,
+    ProcessedRecord,
+    RawRecord,
+    load_processed_records,
+    load_raw_records,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +46,48 @@ class DatasetPipeline:
         config: Optional[PipelineConfig] = None,
         claim_generator: Optional[ClaimGenerator] = None,
         evaluator: Optional[HallucinationEvaluator] = None,
+        resume_raw_path: Optional[Path] = None,
+        resume_processed_path: Optional[Path] = None,
     ) -> None:
         self._config = config or PipelineConfig()
         self._domains = list(domains or default_domains(self._config.max_domains))
         self._claim_generator = claim_generator or ClaimGenerator(config=self._config.claim_generator)
         self._retriever = retriever or OpenAIWebRetriever()
         self._evaluator = evaluator or HallucinationEvaluator()
-        self._writer = DatasetWriter(data_root=data_root, balance_verdicts=self._config.balance_verdicts)
+        self._completed_counts: dict[str, int] = {}
+
+        existing_processed: dict[tuple[str, str, str], ProcessedRecord] = {}
+
+        if resume_raw_path is not None:
+            raw_records = load_raw_records(resume_raw_path)
+            for record in raw_records:
+                self._completed_counts[record.domain] = self._completed_counts.get(record.domain, 0) + 1
+                if record.processed_record is not None:
+                    key = self._processed_key(record.processed_record)
+                    existing_processed[key] = record.processed_record
+
+            logger.info(
+                "Loaded %s existing claims from %s for resume.",
+                sum(self._completed_counts.values()),
+                resume_raw_path,
+            )
+
+        if resume_processed_path is not None:
+            processed_path = Path(resume_processed_path)
+            if not processed_path.exists():
+                raise FileNotFoundError(f"Processed resume path {processed_path} does not exist.")
+            for record in load_processed_records(processed_path):
+                key = self._processed_key(record)
+                existing_processed[key] = record
+
+            logger.info("Loaded %s processed rows from %s.", len(existing_processed), processed_path)
+
+        self._writer = DatasetWriter(
+            data_root=data_root,
+            balance_verdicts=self._config.balance_verdicts,
+            resume_raw_path=resume_raw_path,
+            existing_processed_records=list(existing_processed.values()),
+        )
         self._writer_lock: Optional[asyncio.Lock] = None
 
     async def run_async(self) -> None:
@@ -72,17 +113,32 @@ class DatasetPipeline:
 
         logger.info("Collecting claims for domain %s", domain.name)
 
-        for attempt in range(self._config.max_claims_per_domain):
-            idx = attempt + 1
+        max_claims = self._config.max_claims_per_domain
+        if max_claims is None:
+            raise ValueError("max_claims_per_domain must be specified when running the dataset pipeline.")
 
+        completed = self._completed_counts.get(domain.name, 0)
+        if completed >= max_claims:
+            logger.info(
+                "Domain %s already has %s/%s accepted claims from resume data. Skipping.",
+                domain.name,
+                completed,
+                max_claims,
+            )
+            return
+
+        attempt_index = completed
+
+        while completed < max_claims:
             logger.info(
                 "Generating claim %s/%s for domain %s",
-                idx,
-                self._config.max_claims_per_domain,
+                completed + 1,
+                max_claims,
                 domain.name,
             )
 
-            draft = await self._claim_generator.generate_claim(domain, attempt, semaphore)
+            draft = await self._claim_generator.generate_claim(domain, attempt_index, semaphore)
+            attempt_index += 1
 
             evidence = list(
                 await self._retriever.retrieve_async(draft.claim_text, semaphore)
@@ -92,22 +148,24 @@ class DatasetPipeline:
 
             if not evaluation.is_clear:
                 logger.info(
-                    "Skipping ambiguous verdict for domain %s claim %s/%s",
+                    "Skipping ambiguous verdict for domain %s (accepted %s/%s so far).",
                     domain.name,
-                    idx,
-                    self._config.max_claims_per_domain,
+                    completed,
+                    max_claims,
                 )
                 continue
 
             logger.info(
                 "Verdict for domain %s claim %s/%s: %s",
                 domain.name,
-                idx,
-                self._config.max_claims_per_domain,
+                completed + 1,
+                max_claims,
                 evaluation.verdict,
             )
 
             await self._persist_records(domain, draft, evaluation, evidence)
+            completed += 1
+            self._completed_counts[domain.name] = completed
 
     async def _persist_records(
         self,
@@ -119,15 +177,8 @@ class DatasetPipeline:
         """Write raw and processed records for a single claim evaluation."""
 
         collected_at = timestamp_now()
-        raw_record = RawRecord(
-            domain=domain.name,
-            prompt=self._build_prompt_text(domain, draft),
-            claim_text=draft.claim_text,
-            generator_reasoning=draft.reasoning,
-            retrieved_context=serialize_evidence(evidence),
-            collected_at=collected_at,
-        )
-
+        prompt_text = self._build_prompt_text(domain, draft)
+        serialized_context = serialize_evidence(evidence)
         reference_slots, snippet_slots = self._extract_top_evidence(evidence)
 
         processed_record = ProcessedRecord(
@@ -148,8 +199,17 @@ class DatasetPipeline:
             raise RuntimeError("Writer lock not initialized; run the pipeline via run_async().")
 
         async with self._writer_lock:
-            await asyncio.to_thread(self._writer.append_raw, raw_record)
-            self._writer.append_processed(processed_record)
+            processed_with_split = self._writer.append_processed(processed_record)
+            stored_raw = RawRecord(
+                domain=domain.name,
+                prompt=prompt_text,
+                claim_text=draft.claim_text,
+                generator_reasoning=draft.reasoning,
+                retrieved_context=serialized_context,
+                collected_at=collected_at,
+                processed_record=processed_with_split,
+            )
+            await asyncio.to_thread(self._writer.append_raw, stored_raw)
 
     @staticmethod
     def _build_prompt_text(domain: DomainPrompt, draft: ClaimDraft) -> str:
@@ -191,3 +251,9 @@ class DatasetPipeline:
             snippets.append("")
 
         return references, snippets
+
+    @staticmethod
+    def _processed_key(record: ProcessedRecord) -> tuple[str, str, str]:
+        """Return a deduplication key for processed resume inputs."""
+
+        return (record.domain, record.claim_text, record.collected_at)

@@ -47,6 +47,18 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Minimum log level for pipeline execution.",
     )
+    parser.add_argument(
+        "--resume-raw",
+        type=Path,
+        default=None,
+        help="Existing raw JSONL file to continue appending to.",
+    )
+    parser.add_argument(
+        "--resume-processed",
+        type=Path,
+        default=None,
+        help="Existing processed dataset (CSV/Parquet/JSONL) to seed before resuming.",
+    )
     return parser.parse_args()
 
 
@@ -66,6 +78,8 @@ def main() -> None:
             balance_verdicts=args.balance_verdicts,
             max_domains=args.num_domains,
         ),
+        resume_raw_path=args.resume_raw,
+        resume_processed_path=args.resume_processed,
     )
     asyncio.run(pipeline.run_async())
 

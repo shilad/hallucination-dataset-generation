@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 try:
     import pandas as pd
@@ -29,6 +29,7 @@ class RawRecord:
     generator_reasoning: Optional[str]
     retrieved_context: Iterable[dict]
     collected_at: str
+    processed_record: Optional["ProcessedRecord"] = None
 
     def to_json(self) -> str:
         payload = {
@@ -39,7 +40,26 @@ class RawRecord:
             "retrieved_context": list(self.retrieved_context),
             "collected_at": self.collected_at,
         }
+        if self.processed_record is not None:
+            payload["processed_record"] = self.processed_record.to_dict()
         return json.dumps(payload, ensure_ascii=False)
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "RawRecord":
+        """Rehydrate a raw record from a stored JSON payload."""
+
+        processed_payload = payload.get("processed_record")
+        processed = ProcessedRecord.from_dict(processed_payload) if processed_payload else None
+
+        return cls(
+            domain=payload["domain"],
+            prompt=payload["prompt"],
+            claim_text=payload["claim_text"],
+            generator_reasoning=payload.get("generator_reasoning"),
+            retrieved_context=payload.get("retrieved_context", []),
+            collected_at=payload["collected_at"],
+            processed_record=processed,
+        )
 
 
 @dataclass
@@ -59,6 +79,46 @@ class ProcessedRecord:
     snippet_2: str = ""
     snippet_3: str = ""
 
+    def to_dict(self) -> dict:
+        """Return a serializable representation of the processed record."""
+
+        return {
+            "claim_text": self.claim_text,
+            "verdict": self.verdict,
+            "explanation": self.explanation,
+            "domain": self.domain,
+            "collected_at": self.collected_at,
+            "split": self.split,
+            "reference_1": self.reference_1,
+            "reference_2": self.reference_2,
+            "reference_3": self.reference_3,
+            "snippet_1": self.snippet_1,
+            "snippet_2": self.snippet_2,
+            "snippet_3": self.snippet_3,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Optional[dict]) -> Optional["ProcessedRecord"]:
+        """Create a processed record from a dictionary."""
+
+        if payload is None:
+            return None
+
+        return cls(
+            claim_text=payload["claim_text"],
+            verdict=payload["verdict"],
+            explanation=payload["explanation"],
+            domain=payload["domain"],
+            collected_at=payload["collected_at"],
+            split=payload.get("split"),
+            reference_1=payload.get("reference_1", ""),
+            reference_2=payload.get("reference_2", ""),
+            reference_3=payload.get("reference_3", ""),
+            snippet_1=payload.get("snippet_1", ""),
+            snippet_2=payload.get("snippet_2", ""),
+            snippet_3=payload.get("snippet_3", ""),
+        )
+
 
 @dataclass
 class DatasetWriter:
@@ -69,9 +129,21 @@ class DatasetWriter:
     processed_records: List[ProcessedRecord] = field(default_factory=list)
     _raw_file: Optional[Path] = field(init=False, default=None)
     balance_verdicts: bool = False
+    resume_raw_path: Optional[Path] = None
+    existing_processed_records: Optional[Sequence[ProcessedRecord]] = None
 
     def __post_init__(self) -> None:
         self.data_root.mkdir(parents=True, exist_ok=True)
+        if self.resume_raw_path is not None:
+            if not self.resume_raw_path.exists():
+                raise FileNotFoundError(f"Resume raw path {self.resume_raw_path} does not exist.")
+            self._raw_file = self.resume_raw_path
+            inferred = self._infer_timestamp_from_raw(self.resume_raw_path)
+            if inferred:
+                self.timestamp = inferred
+
+        if self.existing_processed_records:
+            self.processed_records.extend(self.existing_processed_records)
 
     @property
     def raw_path(self) -> Path:
@@ -94,11 +166,12 @@ class DatasetWriter:
             handle.write(record.to_json())
             handle.write("\n")
 
-    def append_processed(self, record: ProcessedRecord) -> None:
+    def append_processed(self, record: ProcessedRecord) -> ProcessedRecord:
         """Buffer processed records for later export."""
 
         assigned = replace(record, split=self._next_split())
         self.processed_records.append(assigned)
+        return assigned
 
     def export_processed(self) -> Path:
         """Write the processed dataset to Parquet (or CSV fallback)."""
@@ -120,7 +193,7 @@ class DatasetWriter:
         """Export processed records to parquet using pandas."""
 
         file_path = self.processed_dir / f"{base_name}.parquet"
-        df = pd.DataFrame([record.__dict__ for record in records])  # type: ignore[arg-type]
+        df = pd.DataFrame([record.to_dict() for record in records])  # type: ignore[arg-type]
         df.to_parquet(file_path, index=False)
         return file_path
 
@@ -147,7 +220,7 @@ class DatasetWriter:
             writer = csv.DictWriter(handle, fieldnames=headers)
             writer.writeheader()
             for record in records:
-                writer.writerow(record.__dict__)
+                writer.writerow(record.to_dict())
         return file_path
 
     def _next_split(self) -> str:
@@ -185,3 +258,58 @@ class DatasetWriter:
                     break
 
         return kept
+
+    @staticmethod
+    def _infer_timestamp_from_raw(raw_path: Path) -> Optional[str]:
+        """Extract the timestamp component from an existing raw filename."""
+
+        stem = raw_path.stem
+        prefix = "claims_"
+        if stem.startswith(prefix):
+            return stem[len(prefix) :]
+        return None
+
+
+def load_raw_records(path: Path) -> List[RawRecord]:
+    """Load raw JSONL records from disk."""
+
+    records: List[RawRecord] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            entry = line.strip()
+            if not entry:
+                continue
+            payload = json.loads(entry)
+            records.append(RawRecord.from_dict(payload))
+    return records
+
+
+def load_processed_records(path: Path) -> List[ProcessedRecord]:
+    """Load processed dataset rows from CSV or Parquet."""
+
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        with path.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            return [ProcessedRecord.from_dict(row) for row in reader if row]
+
+    if suffix == ".parquet":
+        if pd is None:
+            raise RuntimeError("pandas is required to resume from a parquet dataset.")
+        frame = pd.read_parquet(path)
+        return [ProcessedRecord.from_dict(row) for row in frame.to_dict(orient="records")]
+
+    if suffix == ".jsonl":
+        records: List[ProcessedRecord] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                entry = line.strip()
+                if not entry:
+                    continue
+                payload = json.loads(entry)
+                processed = ProcessedRecord.from_dict(payload)
+                if processed is not None:
+                    records.append(processed)
+        return records
+
+    raise ValueError(f"Unsupported processed dataset format: {path}")

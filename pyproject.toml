@@ -9,6 +9,7 @@ dependencies = [
     "pydantic-ai>=0.0.12",
     "openai>=1.44.0",
     "python-dotenv>=1.0.1",
+    "dspy-ai>=2.5.16",
 ]
 
 [project.optional-dependencies]

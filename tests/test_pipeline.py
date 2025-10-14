@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 
 import pytest
@@ -92,3 +93,56 @@ def test_pipeline_writes_raw_and_processed(tmp_path: Path, monkeypatch: pytest.M
         verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
 
     assert verdict_counts.get(SUPPORTED_VERDICT) == verdict_counts.get(UNSUPPORTED_VERDICT)
+
+
+def test_pipeline_resume_from_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain: DomainPrompt) -> None:
+    # Force CSV usage to avoid pandas dependency.
+    import hallucination_creation.writer as writer  # type: ignore
+
+    monkeypatch.setattr(writer, "pd", None)
+
+    first_pipeline = DatasetPipeline(
+        data_root=tmp_path,
+        domains=[domain],
+        config=PipelineConfig(max_claims_per_domain=1, balance_verdicts=False),
+        claim_generator=FakeClaimGenerator(),
+        retriever=FakeRetriever(),
+        evaluator=FakeEvaluator(),
+    )
+    first_pipeline.run()
+
+    raw_files = list((tmp_path / "raw").glob("claims_*.jsonl"))
+    processed_files = list((tmp_path / "processed").glob("dataset_*.csv"))
+
+    assert len(raw_files) == 1
+    assert len(processed_files) == 1
+
+    resume_pipeline = DatasetPipeline(
+        data_root=tmp_path,
+        domains=[domain],
+        config=PipelineConfig(max_claims_per_domain=3, balance_verdicts=False),
+        claim_generator=FakeClaimGenerator(),
+        retriever=FakeRetriever(),
+        evaluator=FakeEvaluator(),
+        resume_raw_path=raw_files[0],
+        resume_processed_path=processed_files[0],
+    )
+    resume_pipeline.run()
+
+    # Raw file should now contain three records total.
+    with raw_files[0].open("r", encoding="utf-8") as handle:
+        stored_rows = [json.loads(line) for line in handle if line.strip()]
+    assert len(stored_rows) == 3
+    assert all("processed_record" in row for row in stored_rows), "Raw resume entries should embed processed payloads."
+
+    # Processed export should include the original and the two newly generated rows.
+    with processed_files[0].open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        processed_rows = list(reader)
+
+    assert len(processed_rows) == 3
+    assert {row["claim_text"] for row in processed_rows} == {
+        "Test Domain claim 0",
+        "Test Domain claim 1",
+        "Test Domain claim 2",
+    }

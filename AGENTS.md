@@ -15,6 +15,7 @@ intentionally shared.
 - `python3 -m venv .venv && source .venv/bin/activate`: create an isolated interpreter aligned with collaborators.
 - `pip install -e .` or `uv sync`: install project dependencies.
 - `uv run python main.py`: execute the web-enabled dataset agent end to end.
+- `uv run python main.py --resume-raw <raw.jsonl> --resume-processed <dataset.csv>`: continue a partial collection run without discarding already evaluated claims.
 - `pytest`: validate shared utilities and regression tests.
 
 ## Coding Style & Naming Conventions
@@ -29,6 +30,11 @@ Use `pytest` to cover prompt builders, response parsers, retrieval fallbacks,
 and dataset validators. Seed randomness (`random.seed(42)`) before generating
 sample responses so tests stay deterministic. Include a smoke test that loads
 processed datasets and asserts required columns before any export.
+
+## Resume Behavior Expectations
+- Raw JSONL entries should retain previously collected data and embed the processed row under a `processed_record` key so subsequent runs recover train/test splits.
+- When resuming, ensure timestamps stay consistent (`claims_<timestamp>.jsonl`, `dataset_<timestamp>.<ext>`) so the pipeline can infer state without duplicating files.
+- Domains that already reached their claim quota must be skipped; new attempts should continue incrementally from stored indices.
 
 ## Commit & Pull Request Guidelines
 Write commits using `type: summary`, such as `feat: add web-backed retrieval`.

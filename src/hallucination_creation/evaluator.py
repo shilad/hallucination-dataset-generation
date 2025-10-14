@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -20,6 +21,7 @@ class EvaluationResult:
     claim_text: str
     verdict: str
     explanation: str
+    is_clear: bool
 
 
 class HallucinationEvaluator:
@@ -36,20 +38,29 @@ class HallucinationEvaluator:
             extra_guidelines=extra_guidelines,
         )
 
-    def evaluate(self, claim_text: str, evidence: Iterable[EvidenceChunk]) -> EvaluationResult:
+    async def evaluate_async(
+        self,
+        claim_text: str,
+        evidence: Iterable[EvidenceChunk],
+        semaphore: asyncio.Semaphore,
+    ) -> EvaluationResult:
         """Return the verdict and explanation for a claim given web evidence."""
 
         evidence_summary = self._summarize_evidence(evidence)
         prompt = self._build_prompt(claim_text, evidence_summary)
 
-        result = self._agent.run_sync(prompt)
+        async with semaphore:
+            result = await asyncio.to_thread(self._agent.run_sync, prompt)
         assessment: HallucinationAssessment = result.output
         verdict = SUPPORTED_VERDICT if assessment.is_supported else UNSUPPORTED_VERDICT
+        reasoning = assessment.reasoning.strip()
+        is_clear = reasoning.upper().startswith("CLEAR:")
 
         return EvaluationResult(
             claim_text=claim_text,
             verdict=verdict,
             explanation=assessment.reasoning,
+            is_clear=is_clear,
         )
 
     @staticmethod

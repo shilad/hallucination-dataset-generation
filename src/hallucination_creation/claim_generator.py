@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -27,7 +28,10 @@ def _create_claim_agent(system_prompt: Optional[str] = None) -> Agent[ClaimDraft
     base_prompt = (
         "You generate concise factual claims that can be validated via current web evidence. "
         "Focus on statements that are either true, false, or currently debated, so that a verification agent can assess them. "
-        "Avoid trivia that is impossible to fact-check online."
+        "Avoid trivia that is impossible to fact-check online. "
+        "The dataset this feeds should be challenging for advanced evaluators, so prefer nuanced, high-impact claims with subtle details that require careful verification. "
+        "Favor scenarios that demand reasoning about causal chains, timelines, or trade-offs rather than shallow recall. "
+        "Only reference information that was true or reported on or before December 31, 2023."
     )
 
     composed_prompt = f"{system_prompt.strip()}\n{base_prompt}" if system_prompt else base_prompt
@@ -54,13 +58,18 @@ class ClaimGenerator:
         self._config = config or ClaimGeneratorConfig()
         self._agent = _create_claim_agent(system_prompt=self._config.custom_system_prompt)
 
-    def generate(self, domain: DomainPrompt) -> Iterable[ClaimDraft]:
-        """Yield up to `max_attempts_per_domain` claim drafts for the domain."""
+    async def generate_claim(
+        self,
+        domain: DomainPrompt,
+        attempt: int,
+        semaphore: asyncio.Semaphore,
+    ) -> ClaimDraft:
+        """Generate a single claim draft using the shared semaphore for LLM throttling."""
 
-        for attempt in range(self._config.max_attempts_per_domain):
-            prompt = self._build_prompt(domain, attempt)
-            result = self._agent.run_sync(prompt)
-            yield result.output
+        prompt = self._build_prompt(domain, attempt)
+        async with semaphore:
+            result = await asyncio.to_thread(self._agent.run_sync, prompt)
+        return result.output
 
     @staticmethod
     def _build_prompt(domain: DomainPrompt, attempt: int) -> str:
@@ -69,6 +78,6 @@ class ClaimGenerator:
         return (
             f"Domain: {domain.name}\n"
             f"{domain.formatted_seed()}\n"
-            f"Attempt {attempt + 1}: Generate one factual claim that is non-trivial and checkable.\n"
-            "Provide the claim as `claim_text` and optionally include `reasoning`."
+            f"Attempt {attempt + 1}: Generate one factual claim that is non-trivial and checkable, grounded in information reported on or before 2023-12-31.\n"
+            "Ensure the claim requires multi-step reasoning or synthesis across sources rather than single data points. Provide the claim as `claim_text` and optionally include `reasoning`."
         )

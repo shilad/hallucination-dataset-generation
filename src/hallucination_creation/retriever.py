@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional
@@ -33,9 +34,10 @@ class EvidenceRetriever:
 class OpenAIWebRetriever(EvidenceRetriever):
     """Implementation that leverages OpenAI's web search tool via the Responses API."""
 
-    def __init__(self, *, model: Optional[str] = None) -> None:
+    def __init__(self, *, model: Optional[str] = None, reasoning_effort: str = "medium") -> None:
         self._client = OpenAI(api_key=self._require_key())
-        self._model = model or os.getenv("OPENAI_RETRIEVER_MODEL", "gpt-4.1-mini")
+        self._model = model or os.getenv("OPENAI_RETRIEVER_MODEL", "gpt-5")
+        self._reasoning_effort = os.getenv("OPENAI_RETRIEVER_REASONING_EFFORT", reasoning_effort)
 
     @staticmethod
     def _require_key() -> str:
@@ -44,48 +46,29 @@ class OpenAIWebRetriever(EvidenceRetriever):
             raise RuntimeError("OPENAI_API_KEY is required for the OpenAIWebRetriever.")
         return api_key
 
-    def retrieve(self, claim_text: str) -> Iterable[EvidenceChunk]:
+    async def retrieve_async(
+        self,
+        claim_text: str,
+        semaphore: asyncio.Semaphore,
+    ) -> Iterable[EvidenceChunk]:
         """Call the OpenAI Responses API with web search enabled and parse snippets."""
 
-        response = self._client.responses.create(
-            model=self._model,
-            input=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Use web search to gather recent evidence supporting or refuting the claim below. "
-                        "Return a JSON object with an `evidence` array. Each entry should include "
-                        "`title`, `url`, and `snippet` fields summarizing the finding.\n\n"
-                        f"Claim: {claim_text}"
-                    ),
-                }
-            ],
-            tools=[{"type": "web_search"}],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "web_evidence",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "evidence": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "title": {"type": "string"},
-                                        "url": {"type": "string"},
-                                        "snippet": {"type": "string"},
-                                    },
-                                    "required": ["title", "url", "snippet"],
-                                },
-                            }
-                        },
-                        "required": ["evidence"],
-                    },
-                },
-            },
+        instruction = (
+            "Use available web search tools to gather evidence supporting or refuting the claim below. "
+            "Respond with a JSON object containing an `evidence` array. Each entry must have `title`, `url`, "
+            "and `snippet` fields summarizing one relevant source. "
+            "Only include evidence published on or before 2023-12-31; ignore later developments.\n\n"
+            f"Claim: {claim_text}"
         )
+
+        async with semaphore:
+            response = await asyncio.to_thread(
+                self._client.responses.create,
+                model=self._model,
+                input=instruction,
+                tools=[{"type": "web_search"}],
+                reasoning={"effort": self._reasoning_effort},
+            )
 
         return self._parse_chunks(response)
 
@@ -94,6 +77,12 @@ class OpenAIWebRetriever(EvidenceRetriever):
         """Normalize OpenAI response content into EvidenceChunk objects."""
 
         chunks: List[EvidenceChunk] = []
+        texts: List[str] = []
+
+        aggregated = getattr(response, "output_text", None)
+        if aggregated:
+            texts.append(aggregated)
+
         outputs = getattr(response, "output", None) or []
         for item in outputs:
             content = getattr(item, "content", None) or []
@@ -101,17 +90,25 @@ class OpenAIWebRetriever(EvidenceRetriever):
                 if getattr(block, "type", None) != "output_text":
                     continue
                 text = getattr(block, "text", "")
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                for entry in data.get("evidence", []):
-                    chunk = EvidenceChunk(
-                        title=entry.get("title", "Unknown Title"),
-                        url=entry.get("url", ""),
-                        snippet=entry.get("snippet", ""),
-                    )
-                    chunks.append(chunk)
+                if text:
+                    texts.append(text)
+
+        for text in texts:
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            for entry in data.get("evidence", []):
+                chunk = EvidenceChunk(
+                    title=entry.get("title", "Unknown Title"),
+                    url=entry.get("url", ""),
+                    snippet=entry.get("snippet", ""),
+                )
+                chunks.append(chunk)
+
+        if not chunks and texts:
+            chunks.append(EvidenceChunk(title="Web Summary", url="", snippet=texts[0]))
+
         return chunks
 
 

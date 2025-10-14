@@ -7,7 +7,7 @@ from typing import Iterable, Optional
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 
 
 class HallucinationAssessment(BaseModel):
@@ -29,6 +29,9 @@ def create_hallucination_agent(
         "If any part of the statement cannot be verified, mark is_supported as False.",
         "Use the supplied evidence summary to ground your reasoning.",
         "Always populate reasoning with citations or the information gap you identify.",
+        "Use only evidence available on or before December 31, 2023; disregard later events.",
+        "The dataset is intended to be challenging, so scrutinize fine-grained details and reject partially correct claims.",
+        "Begin your reasoning with `CLEAR:` when the evidence decisively supports or refutes the claim. Begin with `UNCERTAIN:` when the evidence is inconclusive or conflicting; in that case explain the uncertainty instead of guessing.",
     ]
 
     if extra_guidelines:
@@ -49,10 +52,12 @@ def _build_openai_model() -> OpenAIChatModel:
     """Instantiate the OpenAI chat model, requiring the API key to be available."""
 
     api_key = os.getenv("OPENAI_API_KEY")
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model_name = os.getenv("OPENAI_MODEL", "gpt-5")
+    reasoning_effort = os.getenv("OPENAI_REASONING_EFFORT", "low")
 
     if api_key:
-        return OpenAIChatModel(model_name)
+        settings = OpenAIChatModelSettings(openai_reasoning_effort=reasoning_effort)
+        return OpenAIChatModel(model_name, settings=settings)
 
     raise RuntimeError(
         "OPENAI_API_KEY must be set before creating the hallucination agent. "
